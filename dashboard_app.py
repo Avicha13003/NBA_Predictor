@@ -28,12 +28,28 @@ def load_team_logos():
 
 @st.cache_data
 def load_headshots():
+    import os
     try:
-        heads = pd.read_csv("player_headshots.csv")
-        heads["player_norm"] = heads["player"].astype(str).str.strip().str.lower()
-        return heads
-    except Exception:
-        st.warning("⚠️ player_headshots.csv not found — skipping headshots.")
+        # Try multiple potential paths (Streamlit Cloud may run from /app/src)
+        for path in ["player_headshots.csv", "./src/player_headshots.csv", "./data/player_headshots.csv"]:
+            if os.path.exists(path):
+                heads = pd.read_csv(path)
+
+                # Handle either naming convention
+                if "PLAYER" in heads.columns and "PHOTO_URL" in heads.columns:
+                    heads = heads.rename(columns={"PLAYER": "player", "PHOTO_URL": "image_url"})
+                elif "player" not in heads.columns or "image_url" not in heads.columns:
+                    st.warning(f"⚠️ Columns not found in {path}. Expected PLAYER/PHOTO_URL or player/image_url.")
+                    continue
+
+                heads["player_norm"] = heads["player"].astype(str).str.strip().str.lower()
+                st.success(f"✅ Loaded player_headshots.csv ({len(heads)} rows) from {path}")
+                return heads
+
+        st.warning("⚠️ player_headshots.csv not found in any expected path.")
+        return pd.DataFrame(columns=["player", "image_url", "player_norm"])
+    except Exception as e:
+        st.error(f"❌ Error loading player_headshots.csv: {e}")
         return pd.DataFrame(columns=["player", "image_url", "player_norm"])
 
 # --- Load Data ---
