@@ -1,4 +1,4 @@
-# dashboard_app.py — NBA Player Props Dashboard (fixed IDs + photos/logos)
+# dashboard_app.py — NBA Player Props Dashboard (with team/player filters)
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,13 +28,7 @@ if props.empty or logs.empty:
 def get_player_image(name):
     """Try NBA headshot, fallback placeholder."""
     name_fmt = name.lower().replace(" ", "-")
-    possible_urls = [
-        f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png",
-        f"https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/{name_fmt}.png"
-    ]
-    for u in possible_urls:
-        return u  # Streamlit caches this regardless of load
-    return "https://upload.wikimedia.org/wikipedia/commons/a/ac/No_image_available.svg"
+    return f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png"
 
 @st.cache_data
 def get_team_logo(team_abbr):
@@ -52,7 +46,6 @@ def get_hit_column(market):
     }.get(market)
 
 def render_hit_rate_chart(player, market, unique_key):
-    """Render small trend line with unique Streamlit key per player-market."""
     hit_col = get_hit_column(market)
     if not hit_col or hit_col not in logs.columns:
         return
@@ -64,49 +57,51 @@ def render_hit_rate_chart(player, market, unique_key):
     dfp["RollingRate"] = dfp["Hit"].rolling(5, min_periods=1).mean()
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dfp["GAME_DATE"], y=dfp["Hit"],
-        mode="lines+markers",
-        line=dict(color="green"), name="Hit (1=Over)"
-    ))
-    fig.add_trace(go.Scatter(
-        x=dfp["GAME_DATE"], y=dfp["RollingRate"],
-        mode="lines",
-        line=dict(color="orange", dash="dot"),
-        name="Rolling Avg"
-    ))
-    fig.update_layout(
-        height=150, margin=dict(l=0, r=0, t=0, b=0),
-        yaxis=dict(range=[-0.1, 1.1], tickvals=[0,1]),
-        xaxis_title=None, yaxis_title=None, showlegend=False
-    )
+    fig.add_trace(go.Scatter(x=dfp["GAME_DATE"], y=dfp["Hit"], mode="lines+markers",
+                             line=dict(color="green"), name="Hit (1=Over)"))
+    fig.add_trace(go.Scatter(x=dfp["GAME_DATE"], y=dfp["RollingRate"], mode="lines",
+                             line=dict(color="orange", dash="dot"), name="Rolling Avg"))
+    fig.update_layout(height=150, margin=dict(l=0, r=0, t=0, b=0),
+                      yaxis=dict(range=[-0.1, 1.1], tickvals=[0, 1]),
+                      xaxis_title=None, yaxis_title=None, showlegend=False)
     st.plotly_chart(fig, use_container_width=True, key=f"{player}-{market}-{unique_key}")
 
 # === UI Header ===
 st.title("🏀 NBA Player Props Dashboard")
 st.caption("Daily top player prop overs — with real hit trends, team logos, and injury context.")
 
-# === Tabs ===
-markets = props["MARKET"].unique()
+# === Filter Section ===
+st.sidebar.header("🔍 Filter Options")
+teams = sorted([t for t in props["TEAM"].dropna().unique() if t.strip() != ""])
+players = sorted([p for p in props["PLAYER"].dropna().unique() if p.strip() != ""])
+
+selected_team = st.sidebar.selectbox("Select Team", ["All Teams"] + teams)
+selected_player = st.sidebar.selectbox("Select Player", ["All Players"] + players)
+
+filtered_df = props.copy()
+if selected_team != "All Teams":
+    filtered_df = filtered_df[filtered_df["TEAM"] == selected_team]
+if selected_player != "All Players":
+    filtered_df = filtered_df[filtered_df["PLAYER"] == selected_player]
+
+# === Tabs by Market ===
+markets = filtered_df["MARKET"].unique()
 tabs = st.tabs([f"🔥 {m}" for m in markets])
 
 for tab, market in zip(tabs, markets):
     with tab:
-        subset = props[props["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
-
+        subset = filtered_df[filtered_df["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
         for i, (_, row) in enumerate(subset.iterrows()):
             with st.container(border=True):
                 cols = st.columns([1.2, 3, 2])
                 with cols[0]:
                     st.image(get_player_image(row["PLAYER"]), width=90)
                     st.image(get_team_logo(row["TEAM"]), width=50)
-
                 with cols[1]:
                     st.subheader(row["PLAYER"])
                     st.write(f"**{row['PROP_NAME']} o{row['LINE']}**")
                     st.write(f"Team: `{row['TEAM'] or '—'}` | Injury: {row['INJ_Status']}")
                     st.write(f"Recent Hit Rate: {row['RECENT_OVER_PROB']*100:.1f}% ({int(row['RECENT_N'])} games)")
-
                 with cols[2]:
                     st.metric("Prob. Over", row["FINAL_OVER_PROB_PCT"])
                     render_hit_rate_chart(row["PLAYER"], market, i)
