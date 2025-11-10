@@ -1,4 +1,4 @@
-# dashboard_app.py — NBA Player Props Dashboard (sections + accents + context + sparklines)
+# dashboard_app.py — NBA Player Props Dashboard (final patched version)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,9 +7,7 @@ import altair as alt
 st.set_page_config(page_title="NBA Player Props Dashboard", layout="wide")
 
 # ---------- Helpers ----------
-ALT_TEAM_MAP = {
-    "GS": "GSW", "NO": "NOP", "SA": "SAS", "NY": "NYK", "PHO": "PHX",
-}
+ALT_TEAM_MAP = {"GS": "GSW", "NO": "NOP", "SA": "SAS", "NY": "NYK", "PHO": "PHX"}
 
 def norm_team(x: str) -> str:
     if not isinstance(x, str): return ""
@@ -57,7 +55,6 @@ def load_headshots():
     heads = load_csv("player_headshots.csv")
     if heads.empty:
         return pd.DataFrame(columns=["PLAYER","PHOTO_URL"])
-    # Normalize
     col_player = "PLAYER" if "PLAYER" in heads.columns else "player"
     col_url = "PHOTO_URL" if "PHOTO_URL" in heads.columns else "image_url"
     heads = heads.rename(columns={col_player: "PLAYER", col_url: "PHOTO_URL"})
@@ -73,42 +70,31 @@ def load_team_context():
     return load_csv("team_context.csv")
 
 def compute_player_context(gl_all: pd.DataFrame, player: str, market: str, team_abbr: str):
-    """
-    Returns dict with last5 mean, stdev (volatility), last game snippet, rolling hit rate series.
-    market in {"PTS","3PM","REB","AST","STL"} → uses didHitOver_<stat> if available.
-    """
+    """Compute averages, volatility, last game, hit series safely (no caching)."""
     stat_map = {"PTS":"PTS","3PM":"FG3M","REB":"REB","AST":"AST","STL":"STL"}
     hit_col_map = {
         "PTS":"didHitOver_PTS","3PM":"didHitOver_FG3M","REB":"didHitOver_REB",
         "AST":"didHitOver_AST","STL":"didHitOver_STL",
     }
-    out = {
-        "last5_mean": np.nan, "last5_std": np.nan,
-        "last_game": None, "series": pd.Series(dtype=float),
-        "hit_rate_recent": np.nan, "n_recent": 0,
-    }
+    out = {"last5_mean":np.nan,"last5_std":np.nan,"last_game":None,
+           "series_list":[],"hit_rate_recent":np.nan,"n_recent":0}
     if gl_all.empty or stat_map[market] not in gl_all.columns:
         return out
 
     g = gl_all.copy()
     g["PLAYER"] = g["PLAYER"].astype(str).str.strip()
     g = g[g["PLAYER"] == player].copy()
-    if g.empty: 
-        return out
+    if g.empty: return out
 
-    # dates & sort
     g["GAME_DATE"] = pd.to_datetime(g["GAME_DATE"], errors="coerce")
     g = g.dropna(subset=["GAME_DATE"]).sort_values("GAME_DATE")
-
     stat_col = stat_map[market]
     g[stat_col] = pd.to_numeric(g[stat_col], errors="coerce")
 
-    # last 5 avg / std
     last5 = g.tail(5)
     out["last5_mean"] = float(last5[stat_col].mean()) if len(last5) else np.nan
-    out["last5_std"]  = float(last5[stat_col].std(ddof=0)) if len(last5) else np.nan
+    out["last5_std"] = float(last5[stat_col].std(ddof=0)) if len(last5) else np.nan
 
-    # last game
     lg = g.tail(1)
     if not lg.empty:
         out["last_game"] = {
@@ -117,46 +103,31 @@ def compute_player_context(gl_all: pd.DataFrame, player: str, market: str, team_
             "val": float(lg[stat_col].iloc[0]),
         }
 
-    # recent hit series (last 8) using didHitOver_*
     hit_col = hit_col_map.get(market)
     if hit_col and hit_col in g.columns:
         s = pd.to_numeric(g[hit_col], errors="coerce").fillna(0).tail(8)
-        out["series"] = s
+        out["series_list"] = s.tolist()
         out["n_recent"] = int(len(s))
         out["hit_rate_recent"] = float(s.mean()) if len(s) else np.nan
 
     return out
 
 def opponent_context(ctx_df: pd.DataFrame, team_abbr: str):
-    """Return a rank-ish string using defense z/percentile if rank not provided."""
     if ctx_df.empty: 
         return None
     c = ctx_df.copy()
-    # normalize keys
     c["TEAM_ABBREVIATION"] = c["TEAM_ABBREVIATION"].astype(str).map(norm_team)
-    # prefer explicit rank if exists
-    rank_col = None
     for cand in ["OPP_DEF_RATING_RANK","DEF_RATING_RANK","OPP_DEF_RANK"]:
-        if cand in c.columns: 
-            rank_col = cand; break
-    row = c[c["TEAM_ABBREVIATION"] == team_abbr].tail(1)
-    if row.empty: 
-        return None
-    if rank_col:
-        return int(pd.to_numeric(row[rank_col], errors="coerce").fillna(0).iloc[0])
-    # else infer percentile from DEF_RATING_Z if present
-    if "OPP_DEF_RATING_Z" in c.columns:
-        z = float(pd.to_numeric(row["OPP_DEF_RATING_Z"], errors="coerce").fillna(0).iloc[0])
-        # simple mapping z→percentile
-        from math import erf, sqrt
-        pct_rank = 50 * (1 - erf(z / sqrt(2))) + 50  # ~inverse-ish (lower z = better def)
-        return int(round(pct_rank/2))  # scale into ~1..25ish
+        if cand in c.columns:
+            row = c[c["TEAM_ABBREVIATION"] == team_abbr].tail(1)
+            if not row.empty:
+                return int(pd.to_numeric(row[cand], errors="coerce").fillna(0).iloc[0])
     return None
 
-def sparkline(series: pd.Series, color="#2ecc71"):
-    if series is None or len(series)==0:
+def sparkline(series_list, color="#2ecc71"):
+    if not series_list or len(series_list)==0:
         return None
-    data = pd.DataFrame({"idx": range(1, len(series)+1), "val": series.values})
+    data = pd.DataFrame({"idx": range(1, len(series_list)+1), "val": series_list})
     chart = alt.Chart(data).mark_line(point=False).encode(
         x=alt.X("idx:Q", axis=None),
         y=alt.Y("val:Q", axis=None, scale=alt.Scale(domain=[0,1])),
@@ -174,10 +145,9 @@ ctx = load_team_context()
 if preds.empty:
     st.stop()
 
-# Merge assets
 preds["PLAYER_NORM"] = preds["PLAYER"].str.lower().str.strip()
 if not heads.empty:
-    preds = preds.merge(heads[["PLAYER_NORM","PHOTO_URL"]], left_on="PLAYER_NORM", right_on="PLAYER_NORM", how="left")
+    preds = preds.merge(heads[["PLAYER_NORM","PHOTO_URL"]], on="PLAYER_NORM", how="left")
 else:
     preds["PHOTO_URL"] = ""
 
@@ -186,7 +156,6 @@ if not logos.empty:
 else:
     preds[["TEAM_FULL","LOGO_URL","PRIMARY_COLOR","SECONDARY_COLOR"]] = ["","","",""]
 
-# Fallbacks
 preds["PHOTO_URL"] = preds["PHOTO_URL"].fillna("https://cdn.nba.com/manage/2021/10/NBA_Silhouette.png")
 preds["LOGO_URL"] = preds["LOGO_URL"].fillna("")
 preds["PRIMARY_COLOR"] = preds["PRIMARY_COLOR"].fillna("#333333")
@@ -209,7 +178,7 @@ sort_by = st.sidebar.selectbox(
     ["Prob Over (desc)","Line Edge (SEASON_VAL - LINE)","Recent Hit Rate","Volatility (std, asc)"]
 )
 
-# Apply filters
+# ---------- Filtering ----------
 view = preds.copy()
 if team_pick != "All Teams":
     view = view[view["TEAM"] == team_pick]
@@ -220,7 +189,6 @@ if player_pick != "All Players":
 st.markdown("### 🏀 NBA Player Props Dashboard")
 st.caption("Daily NBA Trends & Predictions — updated at least 2 hours before first tip.")
 
-# Section tabs
 markets = view["MARKET"].dropna().unique().tolist()
 if not markets:
     st.info("No props found.")
@@ -236,7 +204,6 @@ for tab, market in zip(tabs, markets):
             st.info("No data for this market.")
             continue
 
-        # compute sort keys using rolling context from game log
         ctx_rows = []
         for _, r in sub.iterrows():
             ctxp = compute_player_context(gl, r["PLAYER"], market, r.get("TEAM",""))
@@ -247,12 +214,13 @@ for tab, market in zip(tabs, markets):
                 "hit_rate_recent": ctxp["hit_rate_recent"],
                 "n_recent": ctxp["n_recent"],
                 "last_game": ctxp["last_game"],
-                "series": ctxp["series"],
+                "series_list": ctxp["series_list"],
             })
         ctx_df = pd.DataFrame(ctx_rows)
 
         sub = sub.merge(ctx_df, on="PLAYER", how="left")
-        sub["line_edge"] = (pd.to_numeric(sub.get("SEASON_VAL",0), errors="coerce") - pd.to_numeric(sub.get("LINE",0), errors="coerce"))
+        sub["line_edge"] = (pd.to_numeric(sub.get("SEASON_VAL",0), errors="coerce") - 
+                            pd.to_numeric(sub.get("LINE",0), errors="coerce"))
 
         if sort_by == "Prob Over (desc)":
             sub = sub.sort_values("FINAL_OVER_PROB", ascending=False)
@@ -263,7 +231,6 @@ for tab, market in zip(tabs, markets):
         elif sort_by == "Volatility (std, asc)":
             sub = sub.sort_values(sub["last5_std"].fillna(9e9), ascending=True)
 
-        # ----- Section header & divider -----
         st.subheader(f"{market} · Top Overs")
         st.divider()
 
@@ -272,11 +239,9 @@ for tab, market in zip(tabs, markets):
             sec  = row.get("SECONDARY_COLOR","#777777")
 
             with st.container(border=True):
-                # colored divider bar
                 st.markdown(f"<div style='height:4px;background:linear-gradient(90deg,{prim},{sec});border-radius:4px;'></div>", unsafe_allow_html=True)
                 c1, c2, c3, c4 = st.columns([1.0, 3.0, 2.2, 1.4])
 
-                # left: images
                 with c1:
                     if isinstance(row.get("PHOTO_URL",""), str) and row["PHOTO_URL"].startswith("http"):
                         st.image(row["PHOTO_URL"], width=86)
@@ -285,7 +250,6 @@ for tab, market in zip(tabs, markets):
                     if isinstance(row.get("LOGO_URL",""), str) and row["LOGO_URL"].startswith("http"):
                         st.image(row["LOGO_URL"], width=42)
 
-                # middle: identity and prop
                 with c2:
                     st.markdown(f"#### {row['PLAYER']}")
                     st.markdown(f"**{row['PROP_NAME']} o{row['LINE']}**")
@@ -297,7 +261,6 @@ for tab, market in zip(tabs, markets):
                         lg = row["last_game"]
                         st.caption(f"Last game ({lg['date']}): {lg['val']} {market} — Team: {lg['team']}{' | Opp Def Rank: ' + str(opp_rank) if opp_rank else ''}")
 
-                # right: probabilities + recent
                 with c3:
                     st.metric("Prob. Over", row.get("FINAL_OVER_PROB_PCT","—"))
                     hr = row.get("hit_rate_recent", np.nan)
@@ -308,19 +271,14 @@ for tab, market in zip(tabs, markets):
                     )
                     st.caption(f"Line edge: {row['line_edge']:+.2f}")
 
-                # sparkline
                 with c4:
-                    chart = sparkline(row.get("series"), color=color_for(row.get("hit_rate_recent"), hi_good=True))
+                    chart = sparkline(row.get("series_list"), color=color_for(row.get("hit_rate_recent"), hi_good=True))
                     if chart is not None:
                         st.altair_chart(chart, use_container_width=True)
                     else:
                         st.caption("No recent series")
 
-            # small spacing between cards
             st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-        # subtle divider after market
         st.divider()
 
-# ----------- Footer / description -----------
 st.caption("Daily NBA Trends & Predictions — powered by your pipeline • Mobile-friendly • Free on Streamlit Cloud")
