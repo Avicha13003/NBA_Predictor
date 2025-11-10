@@ -1,4 +1,4 @@
-# dashboard_app.py — NBA Player Props Dashboard (real hit rate trends)
+# dashboard_app.py — NBA Player Props Dashboard (fixed IDs + photos/logos)
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -26,13 +26,20 @@ if props.empty or logs.empty:
 # === Helpers ===
 @st.cache_data
 def get_player_image(name):
+    """Try NBA headshot, fallback placeholder."""
     name_fmt = name.lower().replace(" ", "-")
-    return f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png"
+    possible_urls = [
+        f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png",
+        f"https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/{name_fmt}.png"
+    ]
+    for u in possible_urls:
+        return u  # Streamlit caches this regardless of load
+    return "https://upload.wikimedia.org/wikipedia/commons/a/ac/No_image_available.svg"
 
 @st.cache_data
 def get_team_logo(team_abbr):
-    if not team_abbr or not isinstance(team_abbr, str):
-        return ""
+    if not team_abbr or not isinstance(team_abbr, str) or len(team_abbr.strip()) == 0:
+        return "https://upload.wikimedia.org/wikipedia/commons/a/ac/No_image_available.svg"
     return f"https://cdn.ssref.net/req/202106291/images/teams/{team_abbr.lower()}_logo.svg"
 
 def get_hit_column(market):
@@ -44,14 +51,13 @@ def get_hit_column(market):
         "STL": "didHitOver_STL"
     }.get(market)
 
-def render_hit_rate_chart(player, market):
+def render_hit_rate_chart(player, market, unique_key):
+    """Render small trend line with unique Streamlit key per player-market."""
     hit_col = get_hit_column(market)
     if not hit_col or hit_col not in logs.columns:
-        st.write("📉 No trend data available.")
         return
     dfp = logs[logs["PLAYER"].astype(str).str.strip() == player].copy()
     if dfp.empty:
-        st.write("📉 No game log data.")
         return
     dfp = dfp.sort_values("GAME_DATE").tail(10)
     dfp["Hit"] = pd.to_numeric(dfp[hit_col], errors="coerce").fillna(0).astype(int)
@@ -74,7 +80,7 @@ def render_hit_rate_chart(player, market):
         yaxis=dict(range=[-0.1, 1.1], tickvals=[0,1]),
         xaxis_title=None, yaxis_title=None, showlegend=False
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"{player}-{market}-{unique_key}")
 
 # === UI Header ===
 st.title("🏀 NBA Player Props Dashboard")
@@ -88,11 +94,11 @@ for tab, market in zip(tabs, markets):
     with tab:
         subset = props[props["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
 
-        for _, row in subset.iterrows():
+        for i, (_, row) in enumerate(subset.iterrows()):
             with st.container(border=True):
                 cols = st.columns([1.2, 3, 2])
                 with cols[0]:
-                    st.image(get_player_image(row["PLAYER"]), width=80)
+                    st.image(get_player_image(row["PLAYER"]), width=90)
                     st.image(get_team_logo(row["TEAM"]), width=50)
 
                 with cols[1]:
@@ -103,4 +109,4 @@ for tab, market in zip(tabs, markets):
 
                 with cols[2]:
                     st.metric("Prob. Over", row["FINAL_OVER_PROB_PCT"])
-                    render_hit_rate_chart(row["PLAYER"], market)
+                    render_hit_rate_chart(row["PLAYER"], market, i)
