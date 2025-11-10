@@ -1,4 +1,4 @@
-# dashboard_app.py — NBA Player Props Dashboard (with team/player filters)
+# dashboard_app.py — NBA Player Props Dashboard (with team logo mapping)
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,30 +11,26 @@ def load_data():
     try:
         props = pd.read_csv("nba_prop_predictions_today.csv")
         logs = pd.read_csv("player_game_log.csv")
+        team_logos = pd.read_csv("team_logos.csv")
         props["RECENT_OVER_PROB"] = pd.to_numeric(props["RECENT_OVER_PROB"], errors="coerce").fillna(0)
         props["RECENT_N"] = pd.to_numeric(props["RECENT_N"], errors="coerce").fillna(0)
         logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"], errors="coerce")
-        return props, logs
+        team_logos = team_logos.set_index("TEAM")["LOGO_URL"].to_dict()
+        return props, logs, team_logos
     except Exception as e:
         st.error(f"⚠️ Could not load CSVs: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
 
-props, logs = load_data()
+props, logs, team_logos = load_data()
 if props.empty or logs.empty:
     st.stop()
 
 # === Helpers ===
 @st.cache_data
-def get_player_image(name):
-    """Try NBA headshot, fallback placeholder."""
-    name_fmt = name.lower().replace(" ", "-")
-    return f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png"
-
-@st.cache_data
 def get_team_logo(team_abbr):
-    if not team_abbr or not isinstance(team_abbr, str) or len(team_abbr.strip()) == 0:
-        return "https://upload.wikimedia.org/wikipedia/commons/a/ac/No_image_available.svg"
-    return f"https://cdn.ssref.net/req/202106291/images/teams/{team_abbr.lower()}_logo.svg"
+    if team_abbr in team_logos:
+        return team_logos[team_abbr]
+    return "https://upload.wikimedia.org/wikipedia/commons/a/ac/No_image_available.svg"
 
 def get_hit_column(market):
     return {
@@ -68,9 +64,9 @@ def render_hit_rate_chart(player, market, unique_key):
 
 # === UI Header ===
 st.title("🏀 NBA Player Props Dashboard")
-st.caption("Daily top player prop overs — with real hit trends, team logos, and injury context.")
+st.caption("Daily top player prop overs — with team logos, trends, and injury context.")
 
-# === Filter Section ===
+# === Sidebar Filters ===
 st.sidebar.header("🔍 Filter Options")
 teams = sorted([t for t in props["TEAM"].dropna().unique() if t.strip() != ""])
 players = sorted([p for p in props["PLAYER"].dropna().unique() if p.strip() != ""])
@@ -93,10 +89,9 @@ for tab, market in zip(tabs, markets):
         subset = filtered_df[filtered_df["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
         for i, (_, row) in enumerate(subset.iterrows()):
             with st.container(border=True):
-                cols = st.columns([1.2, 3, 2])
+                cols = st.columns([1, 3, 2])
                 with cols[0]:
-                    st.image(get_player_image(row["PLAYER"]), width=90)
-                    st.image(get_team_logo(row["TEAM"]), width=50)
+                    st.image(get_team_logo(row["TEAM"]), width=60)
                 with cols[1]:
                     st.subheader(row["PLAYER"])
                     st.write(f"**{row['PROP_NAME']} o{row['LINE']}**")
