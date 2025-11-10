@@ -1,143 +1,326 @@
-# dashboard_app.py — NBA Player Props Dashboard (filters + logos + headshots + safe image handling)
+# dashboard_app.py — NBA Player Props Dashboard (sections + accents + context + sparklines)
 import streamlit as st
 import pandas as pd
+import numpy as np
+import altair as alt
 
 st.set_page_config(page_title="NBA Player Props Dashboard", layout="wide")
 
-# --- Cached loaders ---
+# ---------- Helpers ----------
+ALT_TEAM_MAP = {
+    "GS": "GSW", "NO": "NOP", "SA": "SAS", "NY": "NYK", "PHO": "PHX",
+}
+
+def norm_team(x: str) -> str:
+    if not isinstance(x, str): return ""
+    x = x.strip().upper()
+    return ALT_TEAM_MAP.get(x, x)
+
+def pct(x): 
+    return f"{x*100:.1f}%" if pd.notna(x) else "—"
+
+def color_for(val, hi_good=True):
+    if pd.isna(val): return "#999999"
+    if hi_good:
+        return "#2ecc71" if val >= 0.6 else ("#f39c12" if val >= 0.4 else "#e74c3c")
+    else:
+        return "#e74c3c" if val >= 0.6 else ("#f39c12" if val >= 0.4 else "#2ecc71")
+
 @st.cache_data
-def load_predictions():
+def load_csv(path, **kwargs):
     try:
-        df = pd.read_csv("nba_prop_predictions_today.csv")
-        df["PLAYER"] = df["PLAYER"].astype(str).str.strip()
-        df["TEAM"] = df["TEAM"].astype(str).str.strip()
+        df = pd.read_csv(path, **kwargs)
+        st.toast(f"Loaded {path} ({len(df)} rows)", icon="✅")
         return df
     except Exception:
-        st.error("⚠️ Could not load nba_prop_predictions_today.csv")
+        st.warning(f"⚠️ Could not load {path}")
         return pd.DataFrame()
 
 @st.cache_data
+def load_predictions():
+    df = load_csv("nba_prop_predictions_today.csv")
+    if df.empty: return df
+    df["PLAYER"] = df["PLAYER"].astype(str).str.strip()
+    df["TEAM"] = df["TEAM"].astype(str).map(norm_team)
+    return df
+
+@st.cache_data
 def load_team_logos():
-    try:
-        logos = pd.read_csv("team_logos.csv")
-        logos["TEAM"] = logos["TEAM"].astype(str).str.strip().str.upper()
-        return logos
-    except Exception:
-        st.warning("⚠️ team_logos.csv not found — skipping logos.")
-        return pd.DataFrame(columns=["TEAM", "LOGO_URL"])
+    logos = load_csv("team_logos.csv")
+    if logos.empty: 
+        return pd.DataFrame(columns=["TEAM","TEAM_FULL","LOGO_URL","PRIMARY_COLOR","SECONDARY_COLOR"])
+    logos["TEAM"] = logos["TEAM"].astype(str).str.strip().str.upper()
+    return logos
 
 @st.cache_data
 def load_headshots():
-    import os
-    try:
-        # Try multiple potential paths (Streamlit Cloud may run from /app/src)
-        for path in ["player_headshots.csv", "./src/player_headshots.csv", "./data/player_headshots.csv"]:
-            if os.path.exists(path):
-                heads = pd.read_csv(path)
+    heads = load_csv("player_headshots.csv")
+    if heads.empty:
+        return pd.DataFrame(columns=["PLAYER","PHOTO_URL"])
+    # Normalize
+    col_player = "PLAYER" if "PLAYER" in heads.columns else "player"
+    col_url = "PHOTO_URL" if "PHOTO_URL" in heads.columns else "image_url"
+    heads = heads.rename(columns={col_player: "PLAYER", col_url: "PHOTO_URL"})
+    heads["PLAYER_NORM"] = heads["PLAYER"].astype(str).str.lower().str.strip()
+    return heads[["PLAYER","PLAYER_NORM","PHOTO_URL"]]
 
-                # Handle either naming convention
-                if "PLAYER" in heads.columns and "PHOTO_URL" in heads.columns:
-                    heads = heads.rename(columns={"PLAYER": "player", "PHOTO_URL": "image_url"})
-                elif "player" not in heads.columns or "image_url" not in heads.columns:
-                    st.warning(f"⚠️ Columns not found in {path}. Expected PLAYER/PHOTO_URL or player/image_url.")
-                    continue
+@st.cache_data
+def load_game_log():
+    return load_csv("player_game_log.csv")
 
-                heads["player_norm"] = heads["player"].astype(str).str.strip().str.lower()
-                st.success(f"✅ Loaded player_headshots.csv ({len(heads)} rows) from {path}")
-                return heads
+@st.cache_data
+def load_team_context():
+    return load_csv("team_context.csv")
 
-        st.warning("⚠️ player_headshots.csv not found in any expected path.")
-        return pd.DataFrame(columns=["player", "image_url", "player_norm"])
-    except Exception as e:
-        st.error(f"❌ Error loading player_headshots.csv: {e}")
-        return pd.DataFrame(columns=["player", "image_url", "player_norm"])
+def compute_player_context(gl_all: pd.DataFrame, player: str, market: str, team_abbr: str):
+    """
+    Returns dict with last5 mean, stdev (volatility), last game snippet, rolling hit rate series.
+    market in {"PTS","3PM","REB","AST","STL"} → uses didHitOver_<stat> if available.
+    """
+    stat_map = {"PTS":"PTS","3PM":"FG3M","REB":"REB","AST":"AST","STL":"STL"}
+    hit_col_map = {
+        "PTS":"didHitOver_PTS","3PM":"didHitOver_FG3M","REB":"didHitOver_REB",
+        "AST":"didHitOver_AST","STL":"didHitOver_STL",
+    }
+    out = {
+        "last5_mean": np.nan, "last5_std": np.nan,
+        "last_game": None, "series": pd.Series(dtype=float),
+        "hit_rate_recent": np.nan, "n_recent": 0,
+    }
+    if gl_all.empty or stat_map[market] not in gl_all.columns:
+        return out
 
-# --- Load Data ---
-df = load_predictions()
+    g = gl_all.copy()
+    g["PLAYER"] = g["PLAYER"].astype(str).str.strip()
+    g = g[g["PLAYER"] == player].copy()
+    if g.empty: 
+        return out
+
+    # dates & sort
+    g["GAME_DATE"] = pd.to_datetime(g["GAME_DATE"], errors="coerce")
+    g = g.dropna(subset=["GAME_DATE"]).sort_values("GAME_DATE")
+
+    stat_col = stat_map[market]
+    g[stat_col] = pd.to_numeric(g[stat_col], errors="coerce")
+
+    # last 5 avg / std
+    last5 = g.tail(5)
+    out["last5_mean"] = float(last5[stat_col].mean()) if len(last5) else np.nan
+    out["last5_std"]  = float(last5[stat_col].std(ddof=0)) if len(last5) else np.nan
+
+    # last game
+    lg = g.tail(1)
+    if not lg.empty:
+        out["last_game"] = {
+            "date": lg["GAME_DATE"].iloc[0].date().isoformat(),
+            "team": str(lg["TEAM"].iloc[0]),
+            "val": float(lg[stat_col].iloc[0]),
+        }
+
+    # recent hit series (last 8) using didHitOver_*
+    hit_col = hit_col_map.get(market)
+    if hit_col and hit_col in g.columns:
+        s = pd.to_numeric(g[hit_col], errors="coerce").fillna(0).tail(8)
+        out["series"] = s
+        out["n_recent"] = int(len(s))
+        out["hit_rate_recent"] = float(s.mean()) if len(s) else np.nan
+
+    return out
+
+def opponent_context(ctx_df: pd.DataFrame, team_abbr: str):
+    """Return a rank-ish string using defense z/percentile if rank not provided."""
+    if ctx_df.empty: 
+        return None
+    c = ctx_df.copy()
+    # normalize keys
+    c["TEAM_ABBREVIATION"] = c["TEAM_ABBREVIATION"].astype(str).map(norm_team)
+    # prefer explicit rank if exists
+    rank_col = None
+    for cand in ["OPP_DEF_RATING_RANK","DEF_RATING_RANK","OPP_DEF_RANK"]:
+        if cand in c.columns: 
+            rank_col = cand; break
+    row = c[c["TEAM_ABBREVIATION"] == team_abbr].tail(1)
+    if row.empty: 
+        return None
+    if rank_col:
+        return int(pd.to_numeric(row[rank_col], errors="coerce").fillna(0).iloc[0])
+    # else infer percentile from DEF_RATING_Z if present
+    if "OPP_DEF_RATING_Z" in c.columns:
+        z = float(pd.to_numeric(row["OPP_DEF_RATING_Z"], errors="coerce").fillna(0).iloc[0])
+        # simple mapping z→percentile
+        from math import erf, sqrt
+        pct_rank = 50 * (1 - erf(z / sqrt(2))) + 50  # ~inverse-ish (lower z = better def)
+        return int(round(pct_rank/2))  # scale into ~1..25ish
+    return None
+
+def sparkline(series: pd.Series, color="#2ecc71"):
+    if series is None or len(series)==0:
+        return None
+    data = pd.DataFrame({"idx": range(1, len(series)+1), "val": series.values})
+    chart = alt.Chart(data).mark_line(point=False).encode(
+        x=alt.X("idx:Q", axis=None),
+        y=alt.Y("val:Q", axis=None, scale=alt.Scale(domain=[0,1])),
+        color=alt.value(color)
+    ).properties(height=30)
+    return chart
+
+# ---------- Load Data ----------
+preds = load_predictions()
 logos = load_team_logos()
-headshots = load_headshots()
+heads = load_headshots()
+gl = load_game_log()
+ctx = load_team_context()
 
-if df.empty:
+if preds.empty:
     st.stop()
 
-# --- Merge assets ---
-df["player_norm"] = df["PLAYER"].str.lower().str.strip()
-df["TEAM"] = df["TEAM"].fillna("").str.upper()
-
-if not headshots.empty:
-    df = df.merge(headshots[["player_norm", "image_url"]], on="player_norm", how="left")
+# Merge assets
+preds["PLAYER_NORM"] = preds["PLAYER"].str.lower().str.strip()
+if not heads.empty:
+    preds = preds.merge(heads[["PLAYER_NORM","PHOTO_URL"]], left_on="PLAYER_NORM", right_on="PLAYER_NORM", how="left")
 else:
-    df["image_url"] = ""
+    preds["PHOTO_URL"] = ""
 
 if not logos.empty:
-    df = df.merge(logos, on="TEAM", how="left")
+    preds = preds.merge(logos, on="TEAM", how="left")
 else:
-    df["LOGO_URL"] = ""
+    preds[["TEAM_FULL","LOGO_URL","PRIMARY_COLOR","SECONDARY_COLOR"]] = ["","","",""]
 
-# Fill fallback images
-df["image_url"] = df["image_url"].fillna("https://cdn.nba.com/manage/2021/10/NBA_Silhouette.png")
-df["LOGO_URL"] = df["LOGO_URL"].fillna("")
+# Fallbacks
+preds["PHOTO_URL"] = preds["PHOTO_URL"].fillna("https://cdn.nba.com/manage/2021/10/NBA_Silhouette.png")
+preds["LOGO_URL"] = preds["LOGO_URL"].fillna("")
+preds["PRIMARY_COLOR"] = preds["PRIMARY_COLOR"].fillna("#333333")
+preds["SECONDARY_COLOR"] = preds["SECONDARY_COLOR"].fillna("#777777")
 
-# --- Sidebar Filters ---
-st.sidebar.title("🔍 Filters")
+# ---------- Sidebar Filters ----------
+st.sidebar.title("🔎 Filters")
+teams = ["All Teams"] + sorted([t for t in preds["TEAM"].dropna().unique().tolist() if t])
+team_pick = st.sidebar.selectbox("Select Team", teams)
 
-teams = sorted(df["TEAM"].dropna().unique().tolist())
-selected_team = st.sidebar.selectbox("Select Team", ["All Teams"] + teams)
-
-if selected_team != "All Teams":
-    filtered_players = sorted(df[df["TEAM"] == selected_team]["PLAYER"].unique().tolist())
+if team_pick != "All Teams":
+    player_opts = ["All Players"] + sorted(preds.loc[preds["TEAM"]==team_pick,"PLAYER"].unique().tolist())
 else:
-    filtered_players = sorted(df["PLAYER"].unique().tolist())
+    player_opts = ["All Players"] + sorted(preds["PLAYER"].unique().tolist())
 
-selected_player = st.sidebar.selectbox("Select Player", ["All Players"] + filtered_players)
+player_pick = st.sidebar.selectbox("Select Player", player_opts)
+
+sort_by = st.sidebar.selectbox(
+    "Sort by",
+    ["Prob Over (desc)","Line Edge (SEASON_VAL - LINE)","Recent Hit Rate","Volatility (std, asc)"]
+)
 
 # Apply filters
-filtered_df = df.copy()
-if selected_team != "All Teams":
-    filtered_df = filtered_df[filtered_df["TEAM"] == selected_team]
-if selected_player != "All Players":
-    filtered_df = filtered_df[filtered_df["PLAYER"] == selected_player]
+view = preds.copy()
+if team_pick != "All Teams":
+    view = view[view["TEAM"] == team_pick]
+if player_pick != "All Players":
+    view = view[view["PLAYER"] == player_pick]
 
-# --- Header ---
-st.title("🏀 NBA Player Props Dashboard")
-st.caption("Automatically updated daily — top overs with probabilities, trends, and injuries.")
+# ---------- Header ----------
+st.markdown("### 🏀 NBA Player Props Dashboard")
+st.caption("Daily NBA Trends & Predictions — updated at least 2 hours before first tip.")
 
-# --- Market Tabs ---
-markets = filtered_df["MARKET"].dropna().unique()
-tabs = st.tabs([f"{m}" for m in markets])
+# Section tabs
+markets = view["MARKET"].dropna().unique().tolist()
+if not markets:
+    st.info("No props found.")
+    st.stop()
 
+tabs = st.tabs([m for m in markets])
+
+# ---------- Per Market ----------
 for tab, market in zip(tabs, markets):
     with tab:
-        subset = filtered_df[filtered_df["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
-        if subset.empty:
-            st.info("No data for this market today.")
+        sub = view[view["MARKET"]==market].copy()
+        if sub.empty:
+            st.info("No data for this market.")
             continue
 
-        for _, row in subset.iterrows():
+        # compute sort keys using rolling context from game log
+        ctx_rows = []
+        for _, r in sub.iterrows():
+            ctxp = compute_player_context(gl, r["PLAYER"], market, r.get("TEAM",""))
+            ctx_rows.append({
+                "PLAYER": r["PLAYER"],
+                "last5_mean": ctxp["last5_mean"],
+                "last5_std": ctxp["last5_std"],
+                "hit_rate_recent": ctxp["hit_rate_recent"],
+                "n_recent": ctxp["n_recent"],
+                "last_game": ctxp["last_game"],
+                "series": ctxp["series"],
+            })
+        ctx_df = pd.DataFrame(ctx_rows)
+
+        sub = sub.merge(ctx_df, on="PLAYER", how="left")
+        sub["line_edge"] = (pd.to_numeric(sub.get("SEASON_VAL",0), errors="coerce") - pd.to_numeric(sub.get("LINE",0), errors="coerce"))
+
+        if sort_by == "Prob Over (desc)":
+            sub = sub.sort_values("FINAL_OVER_PROB", ascending=False)
+        elif sort_by == "Line Edge (SEASON_VAL - LINE)":
+            sub = sub.sort_values("line_edge", ascending=False)
+        elif sort_by == "Recent Hit Rate":
+            sub = sub.sort_values("hit_rate_recent", ascending=False)
+        elif sort_by == "Volatility (std, asc)":
+            sub = sub.sort_values(sub["last5_std"].fillna(9e9), ascending=True)
+
+        # ----- Section header & divider -----
+        st.subheader(f"{market} · Top Overs")
+        st.divider()
+
+        for _, row in sub.head(10).iterrows():
+            prim = row.get("PRIMARY_COLOR","#333333")
+            sec  = row.get("SECONDARY_COLOR","#777777")
+
             with st.container(border=True):
-                cols = st.columns([1, 3, 2])
-                with cols[0]:
-                    # Safe image handling
-                    img_url = row.get("image_url", "")
-                    logo_url = row.get("LOGO_URL", "")
-                    if isinstance(img_url, str) and img_url.startswith("http"):
-                        st.image(img_url, width=80)
+                # colored divider bar
+                st.markdown(f"<div style='height:4px;background:linear-gradient(90deg,{prim},{sec});border-radius:4px;'></div>", unsafe_allow_html=True)
+                c1, c2, c3, c4 = st.columns([1.0, 3.0, 2.2, 1.4])
+
+                # left: images
+                with c1:
+                    if isinstance(row.get("PHOTO_URL",""), str) and row["PHOTO_URL"].startswith("http"):
+                        st.image(row["PHOTO_URL"], width=86)
                     else:
-                        st.image("https://cdn.nba.com/manage/2021/10/NBA_Silhouette.png", width=80)
-                    if isinstance(logo_url, str) and logo_url.startswith("http"):
-                        st.image(logo_url, width=40)
+                        st.image("https://cdn.nba.com/manage/2021/10/NBA_Silhouette.png", width=86)
+                    if isinstance(row.get("LOGO_URL",""), str) and row["LOGO_URL"].startswith("http"):
+                        st.image(row["LOGO_URL"], width=42)
 
-                with cols[1]:
-                    st.subheader(row["PLAYER"])
-                    st.write(f"**{row['PROP_NAME']} o{row['LINE']}**")
-                    st.write(f"Team: `{row['TEAM']}` | Injury: {row['INJ_Status']}")
+                # middle: identity and prop
+                with c2:
+                    st.markdown(f"#### {row['PLAYER']}")
+                    st.markdown(f"**{row['PROP_NAME']} o{row['LINE']}**")
+                    opp_rank = opponent_context(ctx, row.get("TEAM",""))
+                    team_badge = f"<span style='background:{prim};color:white;padding:2px 6px;border-radius:6px;font-size:0.8rem'>{row.get('TEAM','')}</span>"
+                    inj = row.get("INJ_Status","Active")
+                    st.markdown(f"Team: {team_badge} &nbsp;|&nbsp; Injury: **{inj}**", unsafe_allow_html=True)
+                    if row.get("last_game"):
+                        lg = row["last_game"]
+                        st.caption(f"Last game ({lg['date']}): {lg['val']} {market} — Team: {lg['team']}{' | Opp Def Rank: ' + str(opp_rank) if opp_rank else ''}")
 
-                with cols[2]:
-                    st.metric("Prob. Over", row["FINAL_OVER_PROB_PCT"])
-                    if not pd.isna(row.get("RECENT_OVER_PROB", None)):
-                        pct = row["RECENT_OVER_PROB"] * 100
-                        color = "green" if pct > 60 else "orange" if pct > 40 else "red"
-                        st.markdown(
-                            f"<span style='color:{color}'>Recent Hit Rate: {pct:.1f}% ({int(row['RECENT_N'])}g)</span>",
-                            unsafe_allow_html=True,
-                        )
+                # right: probabilities + recent
+                with c3:
+                    st.metric("Prob. Over", row.get("FINAL_OVER_PROB_PCT","—"))
+                    hr = row.get("hit_rate_recent", np.nan)
+                    n  = int(row.get("n_recent", 0) or 0)
+                    st.markdown(
+                        f"<div style='color:{color_for(hr)}'>Recent Hit Rate: {pct(hr)} ({n}g)</div>",
+                        unsafe_allow_html=True
+                    )
+                    st.caption(f"Line edge: {row['line_edge']:+.2f}")
+
+                # sparkline
+                with c4:
+                    chart = sparkline(row.get("series"), color=color_for(row.get("hit_rate_recent"), hi_good=True))
+                    if chart is not None:
+                        st.altair_chart(chart, use_container_width=True)
+                    else:
+                        st.caption("No recent series")
+
+            # small spacing between cards
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # subtle divider after market
+        st.divider()
+
+# ----------- Footer / description -----------
+st.caption("Daily NBA Trends & Predictions — powered by your pipeline • Mobile-friendly • Free on Streamlit Cloud")
