@@ -1,0 +1,256 @@
+# build_team_context.py (UTC→America/Chicago date fix)
+import pandas as pd, numpy as np, requests, time, datetime, logging
+from zoneinfo import ZoneInfo
+from scipy.stats import zscore
+from nba_api.stats.endpoints import TeamDashboardByGeneralSplits
+from nba_api.stats.static import teams as nba_teams
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+ESPN_TEAM_SCHEDULE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule"
+TEAM_CONTEXT_OUT = "team_context.csv"
+
+CHI_TZ = ZoneInfo("America/Chicago")
+
+# ---------------- HTTP Helper ----------------
+def _requests_json(url, retries=3, sleep=0.4):
+    for _ in range(retries):
+        try:
+            r = requests.get(url, timeout=12)
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            logging.warning(f"Request failed {url}: {e}")
+        time.sleep(sleep)
+    return None
+
+# ---------------- ESPN Helpers ----------------
+def espn_scoreboard_for_date(dt: datetime.date):
+    url = f"{ESPN_SCOREBOARD}?dates={dt.strftime('%Y%m%d')}"
+    js = _requests_json(url)
+    return js.get("events", []) if js else []
+
+def _to_ct_date(iso_ts: str) -> str:
+    """
+    Convert an ESPN ISO timestamp to America/Chicago calendar date (YYYY-MM-DD).
+    Handles UTC Z times and offsets correctly.
+    """
+    ts = pd.to_datetime(iso_ts, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return ts.tz_convert(CHI_TZ).date().isoformat()
+
+def parse_espm_games(events):
+    games = []
+    for ev in events:
+        comps = ev.get("competitions", []) or []
+        if not comps:
+            continue
+        comp = comps[0]
+        venue = comp.get("venue", {}) or {}
+        addr = venue.get("address", {}) or {}
+        teams = comp.get("competitors", []) or []
+        if len(teams) != 2:
+            continue
+        home = next((t for t in teams if t.get("homeAway") == "home"), None)
+        away = next((t for t in teams if t.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+        games.append({
+            "GAME_DATE": _to_ct_date(comp.get("date", "")),
+            "ARENA": venue.get("fullName", ""),
+            "CITY": addr.get("city", ""),
+            "STATE": addr.get("state", ""),
+            "HOME_ID": str(home.get("id") or ""),
+            "HOME_TEAM": (home.get("team", {}) or {}).get("abbreviation", ""),
+            "HOME_FULL": (home.get("team", {}) or {}).get("displayName", ""),
+            "AWAY_ID": str(away.get("id") or ""),
+            "AWAY_TEAM": (away.get("team", {}) or {}).get("abbreviation", ""),
+            "AWAY_FULL": (away.get("team", {}) or {}).get("displayName", "")
+        })
+    return pd.DataFrame(games)
+
+def espn_recent_games(team_id: str, asof_ct_date: datetime.date):
+    """
+    Team schedule → completed games only, with gameDate computed in America/Chicago.
+    asof_ct_date is a date() in America/Chicago; we ignore games after this date.
+    """
+    js = _requests_json(ESPN_TEAM_SCHEDULE.format(team_id=team_id))
+    if not js:
+        return []
+    rows = []
+    cutoff = pd.Timestamp(asof_ct_date, tz=CHI_TZ).date()
+    for ev in js.get("events", []):
+        comps = ev.get("competitions", []) or []
+        if not comps:
+            continue
+        comp = comps[0]
+        st = comp.get("status", {}).get("type", {}) or {}
+        if not st.get("completed"):
+            continue
+
+        # Convert ESPN UTC timestamp → CT calendar date
+        gdate_ct_str = _to_ct_date(comp.get("date", ""))
+        if not gdate_ct_str:
+            continue
+        gdate_ct = datetime.date.fromisoformat(gdate_ct_str)
+
+        # Only use games on or before the as-of CT date
+        if gdate_ct > cutoff:
+            continue
+
+        sides = comp.get("competitors", []) or []
+        if len(sides) != 2:
+            continue
+        t0, t1 = sides
+        if str(t0.get("id")) == str(team_id):
+            our, opp = t0, t1
+        elif str(t1.get("id")) == str(team_id):
+            our, opp = t1, t0
+        else:
+            continue
+
+        def score_val(team):
+            val = team.get("score")
+            if isinstance(val, dict):
+                val = val.get("value", 0)
+            return int(val or 0)
+
+        rows.append({
+            "gameDate": gdate_ct_str,           # CT date string YYYY-MM-DD
+            "teamScore": score_val(our),
+            "oppScore": score_val(opp)
+        })
+    rows.sort(key=lambda x: x["gameDate"], reverse=True)
+    return rows
+
+def build_rest_and_opp_points(espm_ids, asof_ct_date: datetime.date):
+    rows = []
+    for tid in sorted(set(espm_ids)):
+        rec = espn_recent_games(tid, asof_ct_date)
+        last = rec[0]["gameDate"] if rec else None
+        opp_pts = np.mean([g["oppScore"] for g in rec]) if rec else np.nan
+        rows.append({"TEAM_ESPN_ID": str(tid), "LAST_GAME_DATE": last, "OPP_PTS": opp_pts})
+        time.sleep(0.08)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # LAST_GAME_DATE is already a CT calendar date string → parse as date (no tz math needed)
+    df["LAST_GAME_DATE"] = pd.to_datetime(df["LAST_GAME_DATE"], format="%Y-%m-%d", errors="coerce")
+    today_ct = pd.Timestamp(asof_ct_date)
+    df["DAYS_REST"] = (today_ct - df["LAST_GAME_DATE"]).dt.days.clip(lower=0)
+    # B2B = played yesterday in CT (i.e., exactly 1 day rest)
+    df["IS_B2B"] = np.where(df["DAYS_REST"] == 1, "Yes", "No")
+    df["OPP_PTS_Z"] = zscore(df["OPP_PTS"].fillna(df["OPP_PTS"].mean()))
+    return df
+
+# ---------------- Defense Snapshot ----------------
+def normalize_abbr(abbr):
+    mapping = {"NO":"NOP","NY":"NYK","UTAH":"UTA","GS":"GSW","SA":"SAS","WSH":"WAS","PHO":"PHX"}
+    return mapping.get(abbr, abbr)
+
+def build_defense_snapshot():
+    logging.info("Fetching league defense snapshot (TeamDashboardByGeneralSplits)...")
+    all_teams = nba_teams.get_teams()
+    rows = []
+    for t in all_teams:
+        tid, name, abbr = t["id"], t["full_name"], t["abbreviation"]
+        def_rating = np.nan
+        try:
+            dash = TeamDashboardByGeneralSplits(
+                team_id=tid,
+                per_mode_detailed="PerGame",
+                measure_type_detailed_defense="Advanced",
+                season_type_all_star="Regular Season"
+            ).get_data_frames()[0]
+            candidates = [c for c in dash.columns if "def" in c.lower() and "rating" in c.lower()]
+            if candidates:
+                def_rating = float(dash.loc[0, candidates[0]])
+        except Exception as e:
+            logging.warning(f"Could not fetch DEF_RATING for {name}: {e}")
+
+        rows.append({
+            "TEAM_NAME": name,
+            "TEAM_ABBREVIATION": abbr,
+            "DEF_RATING": def_rating
+        })
+        time.sleep(0.2)
+    base = pd.DataFrame(rows)
+    base["DEF_RATING_Z"] = zscore(base["DEF_RATING"].fillna(base["DEF_RATING"].mean()))
+    return base
+
+# ---------------- Main ----------------
+def main():
+    today_ct = datetime.datetime.now(CHI_TZ).date()
+    events = espn_scoreboard_for_date(today_ct)
+    sched = parse_espm_games(events)
+    if sched.empty:
+        logging.error("No ESPN games found for today.")
+        return
+    logging.info(f"Parsed {len(sched)} games for {today_ct}")
+
+    # Normalize abbreviations to match nba_api
+    sched["HOME_TEAM"] = sched["HOME_TEAM"].apply(normalize_abbr)
+    sched["AWAY_TEAM"] = sched["AWAY_TEAM"].apply(normalize_abbr)
+
+    defense = build_defense_snapshot()
+    rest_opp = build_rest_and_opp_points(
+        list(sched["HOME_ID"].astype(str)) + list(sched["AWAY_ID"].astype(str)),
+        today_ct
+    )
+
+    # HOME rows
+    home = sched.merge(defense, left_on="HOME_TEAM", right_on="TEAM_ABBREVIATION", how="left")
+    home = home.merge(rest_opp.rename(columns={"TEAM_ESPN_ID":"HOME_ID"}), on="HOME_ID", how="left")
+    home = home.assign(
+        TEAM_ABBREVIATION=sched["HOME_TEAM"],
+        TEAM_NAME=sched["HOME_FULL"],
+        TEAM_SIDE="Home",
+        OPP_TEAM_FULL=sched["AWAY_FULL"],
+        OPP_TEAM_ABBR=sched["AWAY_TEAM"],
+        CITY=sched["CITY"],
+        STATE=sched["STATE"]
+    )
+
+    # AWAY rows
+    away = sched.merge(defense, left_on="AWAY_TEAM", right_on="TEAM_ABBREVIATION", how="left")
+    away = away.merge(rest_opp.rename(columns={"TEAM_ESPN_ID":"AWAY_ID"}), on="AWAY_ID", how="left")
+    away = away.assign(
+        TEAM_ABBREVIATION=sched["AWAY_TEAM"],
+        TEAM_NAME=sched["AWAY_FULL"],
+        TEAM_SIDE="Away",
+        OPP_TEAM_FULL=sched["HOME_FULL"],
+        OPP_TEAM_ABBR=sched["HOME_TEAM"],
+        CITY=sched["CITY"],
+        STATE=sched["STATE"]
+    )
+
+    teams = pd.concat([home, away], ignore_index=True)
+
+    # Opponent mappings
+    opp_def_map = defense.set_index("TEAM_ABBREVIATION")["DEF_RATING_Z"].to_dict()
+    opp_opp_pts_map = rest_opp.set_index("TEAM_ESPN_ID")["OPP_PTS_Z"].to_dict()
+    abbr_to_espm = {normalize_abbr(r["HOME_TEAM"]): r["HOME_ID"] for _, r in sched.iterrows()}
+    abbr_to_espm.update({normalize_abbr(r["AWAY_TEAM"]): r["AWAY_ID"] for _, r in sched.iterrows()})
+
+    teams["OPP_DEF_RATING_Z"] = teams["OPP_TEAM_ABBR"].map(opp_def_map)
+    teams["OPP_OPP_PTS_Z"] = teams["OPP_TEAM_ABBR"].map(lambda ab: opp_opp_pts_map.get(abbr_to_espm.get(ab, ""), np.nan))
+
+    # Format LAST_GAME_DATE for readability
+    teams["LAST_GAME_DATE"] = pd.to_datetime(teams["LAST_GAME_DATE"], errors="coerce").dt.strftime("%m/%d/%Y")
+
+    keep = [
+        "TEAM_ABBREVIATION","TEAM_NAME","TEAM_SIDE","CITY","STATE",
+        "DEF_RATING","DEF_RATING_Z","LAST_GAME_DATE","DAYS_REST","IS_B2B",
+        "OPP_PTS","OPP_PTS_Z","OPP_TEAM_FULL","OPP_DEF_RATING_Z","OPP_OPP_PTS_Z"
+    ]
+    out = teams[keep].drop_duplicates(subset=["TEAM_ABBREVIATION","TEAM_SIDE"]).reset_index(drop=True)
+    out.to_csv(TEAM_CONTEXT_OUT, index=False)
+    logging.info(f"✅ Wrote {TEAM_CONTEXT_OUT} ({len(out)} teams)")
+    print(out.head(12))
+
+if __name__ == "__main__":
+    main()

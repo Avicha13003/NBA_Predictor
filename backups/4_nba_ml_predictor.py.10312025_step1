@@ -1,0 +1,303 @@
+# 4_nba_ml_predictor.py
+import logging, os
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import roc_auc_score
+
+# ==== Files ====
+TODAY_CSV = "nba_today_stats.csv"
+HISTORY_LOG = "player_game_log.csv"
+ROLLING_ALL = "rolling_metrics.csv"          # latest-per-player rolling metrics
+TEAM_CONTEXT = "team_context.csv"            # built by build_team_context.py
+
+OUT_TOP10_30 = "top10_hit30.csv"
+OUT_TOP10_4THREES = "top10_hit4threes.csv"
+OUT_ALL = "nba_predictions_today.csv"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# ---------- Utilities ----------
+def safe_read_csv(path: str) -> pd.DataFrame:
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path)
+        except Exception as e:
+            logging.warning(f"Could not read {path}: {e}")
+    return pd.DataFrame()
+
+def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """
+    Ensure requested columns exist.
+    - numeric columns → fill with 0.0
+    - object/text columns → fill with ""
+    """
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = 0.0
+        else:
+            if out[c].dtype == object or str(out[c].dtype).startswith("string"):
+                out[c] = out[c].fillna("")
+            else:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    return out
+
+def add_basic_today_features(df: pd.DataFrame) -> pd.DataFrame:
+    t = df.copy()
+    for c in ["PTS", "REB", "AST", "FG3M", "MIN"]:
+        t[c] = pd.to_numeric(t.get(c, 0), errors="coerce").fillna(0.0)
+    t["USAGE_LITE"] = ((t["PTS"] + t["REB"] + t["AST"]) / t["MIN"].replace(0, np.nan)).fillna(0) * 100
+    t["THREES_RATE"] = (t["FG3M"] / t["PTS"].replace(0, np.nan)).fillna(0)
+    t["IS_HOME"] = (t.get("TEAM_SIDE", "") == "Home").astype(int)
+    return t
+
+def make_model(feature_cols: list[str]):
+    pre = ColumnTransformer([("num", StandardScaler(), feature_cols)], remainder="drop")
+    clf = LogisticRegression(max_iter=300, solver="lbfgs")
+    return Pipeline([("pre", pre), ("clf", clf)])
+
+def _roll_feature(df: pd.DataFrame, col: str, w: int) -> pd.Series:
+    return (
+        df.groupby("PLAYER")[col]
+          .rolling(w, min_periods=1)
+          .mean()
+          .reset_index(level=0, drop=True)
+          .shift(1)  # prevent leakage
+    )
+
+def prepare_training_sets(history: pd.DataFrame, feature_cols: list[str]):
+    """
+    Build X,y for both targets using full history. Any feature in feature_cols that
+    is missing in history will be created and filled with 0.0 (so context cols fit).
+    """
+    df = history.copy()
+    if df.empty:
+        return pd.DataFrame(), pd.Series(dtype=int), pd.DataFrame(), pd.Series(dtype=int)
+
+    # Normalize PLAYER column name
+    if "PLAYER_NAME" in df.columns and "PLAYER" not in df.columns:
+        df.rename(columns={"PLAYER_NAME": "PLAYER"}, inplace=True)
+
+    for c in ["PTS", "FG3M", "REB", "AST", "MIN"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0.0)
+
+    # Rolling (from history only)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+    df.sort_values(["PLAYER", "GAME_DATE"], inplace=True)
+    df["r3_pts"]  = _roll_feature(df, "PTS", 3)
+    df["r5_pts"]  = _roll_feature(df, "PTS", 5)
+    df["r3_fg3m"] = _roll_feature(df, "FG3M", 3)
+    df["r5_fg3m"] = _roll_feature(df, "FG3M", 5)
+
+    # Derived basics
+    df["USAGE_LITE"] = ((df["PTS"] + df["REB"] + df["AST"]) / df["MIN"].replace(0, np.nan)).fillna(0) * 100
+    df["THREES_RATE"] = (df["FG3M"] / df["PTS"].replace(0, np.nan)).fillna(0)
+    if "TEAM_SIDE" in df.columns:
+        df["IS_HOME"] = (df["TEAM_SIDE"] == "Home").astype(int)
+    else:
+        df["IS_HOME"] = 0
+
+    # Ensure all requested features exist (adds context columns with 0.0 if absent)
+    df = ensure_columns(df, feature_cols + ["didHit30", "didHit4Threes"])
+
+    X = df[feature_cols].fillna(0.0)
+    y30 = df["didHit30"].astype(int)
+    y4  = df["didHit4Threes"].astype(int)
+    return X, y30, X.copy(), y4
+
+def fmt_pct(x: float) -> str:
+    if pd.isna(x) or x < 0.0001:
+        return "~0%"
+    return f"{x*100:.1f}%"
+
+# ---------- Main ----------
+def main():
+    # --- Load inputs
+    today_df = safe_read_csv(TODAY_CSV)
+    if today_df.empty:
+        logging.error("No nba_today_stats.csv found or empty.")
+        return
+
+    history = safe_read_csv(HISTORY_LOG)
+    rolling = safe_read_csv(ROLLING_ALL)
+    context = safe_read_csv(TEAM_CONTEXT)
+
+    # Normalize rolling col names
+    if "PLAYER_NAME" in rolling.columns and "PLAYER" not in rolling.columns:
+        rolling.rename(columns={"PLAYER_NAME": "PLAYER"}, inplace=True)
+
+    # Keep whatever rolling columns exist (robust to schema)
+    rolling_keep = [
+        "PLAYER",
+        "r3_pts","r5_pts","r3_fg3m","r5_fg3m",
+        "r3_fg3_pct","r5_fg3_pct","r3_efg","r5_efg","r3_ts","r5_ts",
+        "r3_PTS","r5_PTS","r3_FG3M","r5_FG3M","r3_FG3_PCT","r5_FG3_PCT","r3_EFG","r5_EFG","r3_TS","r5_TS"
+    ]
+    rolling = rolling[[c for c in rolling_keep if c in rolling.columns]].copy()
+
+    # --- Merge today + rolling
+    today = today_df.copy()
+    today = today.merge(rolling, on="PLAYER", how="left")
+
+    # Coalesce any accidental suffixes
+    def coalesce(df, base):
+        bx, by = f"{base}_x", f"{base}_y"
+        if bx in df.columns or by in df.columns:
+            df[base] = df.get(bx, df.get(by))
+            df.drop(columns=[bx, by], inplace=True, errors="ignore")
+
+    for c in ["TEAM", "TEAM_FULL", "CITY", "STATE", "TEAM_SIDE", "GAME_DATE"]:
+        coalesce(today, c)
+
+    # --- Merge team context on TEAM (abbr) + TEAM_SIDE
+    if not context.empty:
+        # Normalize columns expected from team_context.csv
+        # Required: TEAM_ABBREVIATION, TEAM_SIDE, DEF_RATING_Z, OPP_DEF_RATING_Z, OPP_OPP_PTS_Z, OPP_PTS_Z, DAYS_REST, IS_B2B
+        # Some files may name TEAM_ABBREVIATION as TEAM; handle that.
+        ctx = context.copy()
+        if "TEAM" in ctx.columns and "TEAM_ABBREVIATION" not in ctx.columns:
+            ctx.rename(columns={"TEAM": "TEAM_ABBREVIATION"}, inplace=True)
+
+        # Ensure expected columns exist, fill missing as needed
+        ctx_expected = [
+            "TEAM_ABBREVIATION","TEAM_SIDE",
+            "DEF_RATING_Z","OPP_DEF_RATING_Z","OPP_OPP_PTS_Z","OPP_PTS_Z",
+            "DAYS_REST","IS_B2B"
+        ]
+        ctx = ensure_columns(ctx, ctx_expected)
+
+        # Convert IS_B2B “Yes/No” → numeric 1/0 and keep text too
+        if "IS_B2B" in ctx.columns:
+            ctx["IS_B2B_TEXT"] = ctx["IS_B2B"].astype(str)
+            ctx["IS_B2B_NUM"] = ctx["IS_B2B_TEXT"].str.lower().map({"yes": 1, "no": 0}).fillna(0).astype(int)
+        else:
+            ctx["IS_B2B_TEXT"] = ""
+            ctx["IS_B2B_NUM"] = 0
+
+        # Merge
+        today = today.merge(
+            ctx[
+                ["TEAM_ABBREVIATION","TEAM_SIDE","DEF_RATING_Z","OPP_DEF_RATING_Z","OPP_OPP_PTS_Z",
+                 "OPP_PTS_Z","DAYS_REST","IS_B2B_TEXT","IS_B2B_NUM"]
+            ],
+            left_on=["TEAM","TEAM_SIDE"],
+            right_on=["TEAM_ABBREVIATION","TEAM_SIDE"],
+            how="left"
+        )
+        # Drop helper key if duplicated
+        if "TEAM_ABBREVIATION" in today.columns and "TEAM_ABBREVIATION" != "TEAM":
+            today.drop(columns=["TEAM_ABBREVIATION"], inplace=True)
+
+        logging.info(
+            f"Merged team_context columns — non-null DEF_RATING_Z: "
+            f"{today['DEF_RATING_Z'].notna().sum()} / {len(today)} rows"
+        )
+    else:
+        logging.warning("team_context.csv missing or empty — context features will be zeros.")
+
+    # --- Add base features
+    today = add_basic_today_features(today)
+
+    # --- Feature set (base + context)
+    base_feats = [
+        "PTS","FG3M","REB","AST","MIN",
+        "r3_pts","r5_pts","r3_fg3m","r5_fg3m",
+        "USAGE_LITE","THREES_RATE","IS_HOME"
+    ]
+    context_feats = [
+        "DEF_RATING_Z","OPP_DEF_RATING_Z","OPP_OPP_PTS_Z","OPP_PTS_Z","DAYS_REST","IS_B2B_NUM"
+    ]
+    feature_cols = base_feats + context_feats
+
+    # Ensure columns for today
+    today = ensure_columns(today, feature_cols)
+
+    # --- Training availability + build training sets with context backfilled as 0
+    have_models = False
+    n_total = len(history)
+    n30 = int(history.get("didHit30", pd.Series(dtype=int)).sum())
+    n4  = int(history.get("didHit4Threes", pd.Series(dtype=int)).sum())
+    logging.info(f"📊 Training samples: {n_total} total | {n30} ≥30pt | {n4} ≥4-threes")
+
+    if n_total > 10 and n30 >= 5 and n4 >= 5:
+        X30, y30, X4, y4 = prepare_training_sets(history, feature_cols)
+        if not X30.empty and y30.nunique() == 2 and y4.nunique() == 2:
+            model30 = make_model(feature_cols).fit(X30, y30)
+            model4  = make_model(feature_cols).fit(X4, y4)
+            have_models = True
+            try:
+                auc30 = roc_auc_score(y30, model30.predict_proba(X30)[:, 1])
+                auc4  = roc_auc_score(y4,  model4.predict_proba(X4)[:, 1])
+                logging.info(f"✅ Trained models (AUC30={auc30:.3f}, AUC4={auc4:.3f})")
+            except Exception:
+                pass
+        else:
+            logging.warning("Not enough label diversity to train models — using heuristics.")
+    else:
+        logging.warning("⚠️ Not enough training data — using heuristic predictions.")
+
+    # --- Predict
+    X_today = today[feature_cols].fillna(0.0)
+
+    if have_models:
+        today["prob_hit30"] = np.clip(model30.predict_proba(X_today)[:, 1], 0, 1)
+        today["prob_hit4threes"] = np.clip(model4.predict_proba(X_today)[:, 1], 0, 1)
+        logging.info(f"✅ Generated predictions for {len(today)} players using trained models.")
+    else:
+        # Heuristic with a small nudge from context (DEF_RATING_Z lowers 30pt odds, opponent DEF_RATING_Z lowers 4+ 3PT odds)
+        today["prob_hit30"] = np.clip(
+            (0.55*today["PTS"] + 0.30*today["r5_pts"] + 0.15*today["r3_pts"]
+             - 1.0*today["DEF_RATING_Z"] - 0.3*today["IS_B2B_NUM"] - 22) / 20,
+            0, 1
+        )
+        today["prob_hit4threes"] = np.clip(
+            (0.55*today["FG3M"] + 0.25*today["r5_fg3m"] + 0.20*today["r3_fg3m"]
+             - 0.8*today["OPP_DEF_RATING_Z"] - 0.2*today["IS_B2B_NUM"] - 2.5) / 3.5,
+            0, 1
+        )
+        logging.info(f"✅ Generated heuristic predictions for {len(today)} players.")
+
+    # --- Round + percent strings
+    today["prob_hit30"] = today["prob_hit30"].clip(0, 1).round(4)
+    today["prob_hit4threes"] = today["prob_hit4threes"].clip(0, 1).round(4)
+    today["prob_hit30_pct"] = today["prob_hit30"].apply(fmt_pct)
+    today["prob_hit4threes_pct"] = today["prob_hit4threes"].apply(fmt_pct)
+
+    # --- Save all predictions (include context columns)
+    keep_cols_all = [
+        "PLAYER","TEAM","TEAM_FULL","TEAM_SIDE","PTS","FG3M","REB","AST","MIN",
+        "USAGE_LITE","THREES_RATE","IS_HOME",
+        "r3_pts","r5_pts","r3_fg3m","r5_fg3m",
+        # optional rolling extras if present
+        "r3_fg3_pct","r5_fg3_pct","r3_efg","r5_efg","r3_ts","r5_ts",
+        "ARENA","CITY","STATE","GAME_DATE",
+        # context columns
+        "DEF_RATING_Z","OPP_DEF_RATING_Z","OPP_OPP_PTS_Z","OPP_PTS_Z","DAYS_REST","IS_B2B_NUM","IS_B2B_TEXT",
+        # predictions
+        "prob_hit30","prob_hit30_pct","prob_hit4threes","prob_hit4threes_pct",
+    ]
+    today_out = ensure_columns(today, keep_cols_all)[keep_cols_all]
+    today_out.to_csv(OUT_ALL, index=False)
+    logging.info(f"✅ Saved all predictions to {OUT_ALL} ({len(today_out)} players)")
+
+    # --- Top 10s
+    top30 = today_out.sort_values("prob_hit30", ascending=False).head(10)
+    top43 = today_out.sort_values("prob_hit4threes", ascending=False).head(10)
+    top30.to_csv(OUT_TOP10_30, index=False)
+    top43.to_csv(OUT_TOP10_4THREES, index=False)
+    logging.info(f"🏀 Top 10 saved → {OUT_TOP10_30}, {OUT_TOP10_4THREES}")
+
+    # Quick sanity logs
+    logging.info(
+        "Sample merged context (TEAM, SIDE, DEF_Z, OPP_DEF_Z, REST, B2B):\n" +
+        str(today_out[["TEAM","TEAM_SIDE","DEF_RATING_Z","OPP_DEF_RATING_Z","DAYS_REST","IS_B2B_TEXT"]]
+            .drop_duplicates()
+            .head(12))
+    )
+
+if __name__ == "__main__":
+    main()

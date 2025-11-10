@@ -1,0 +1,268 @@
+import os
+import sys
+import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+# ---- File paths (adjust if you like) ----
+TODAY_CSV = "nba_today_stats.csv"        # your single daily CSV (already working)
+TRAIN_LOG = "nba_training_log.csv"       # cumulative training data
+PRED_TODAY = "nba_predictions_today.csv" # output predictions
+
+# ---- Targets we’re training/predicting ----
+TARGETS = {
+    "hit30": {"desc": "PTS ≥ 30",       "label_col": "hit30"},
+    "hit4threes": {"desc": "FG3M ≥ 4",  "label_col": "hit4threes"}
+}
+
+# ---- Feature config ----
+NUM_COLS = ["PTS", "REB", "AST", "FG3M", "MIN"]
+CAT_COLS = ["TEAM_SIDE", "TEAM", "ARENA", "CITY", "STATE"]  # safe to keep; OHE handles new values
+
+# ---- Minimum rows to train a fresh model ----
+MIN_TRAIN_ROWS = 200
+
+# ------------ Utilities ------------
+
+def load_today():
+    if not Path(TODAY_CSV).exists():
+        logging.error(f"{TODAY_CSV} not found. Generate it first.")
+        sys.exit(1)
+    df = pd.read_csv(TODAY_CSV)
+    # Ensure required columns exist
+    need = {"PLAYER","TEAM","TEAM_SIDE","PTS","REB","AST","FG3M","MIN","ARENA","CITY","STATE","GAME_DATE"}
+    missing = need - set(df.columns)
+    if missing:
+        logging.error(f"{TODAY_CSV} missing columns: {missing}")
+        sys.exit(1)
+    # Clean types
+    for c in ["PTS","REB","AST","FG3M","MIN"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Simple engineered features (based on your per-game avgs)
+    df["USAGE_LITE"] = df["PTS"] + 0.7*df["AST"] + 0.5*df["REB"]
+    df["THREES_RATE"] = df["FG3M"] / df["MIN"].replace(0, np.nan)
+    df["IS_HOME"] = (df["TEAM_SIDE"].str.lower() == "home").astype(int)
+    return df.fillna(0)
+
+def ensure_train_log_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure the training log has columns for labels if present.
+    You will add outcomes later via `ingest_boxscores()` helper.
+    """
+    base_cols = ["PLAYER","TEAM","TEAM_SIDE","PTS","REB","AST","FG3M","MIN",
+                 "ARENA","CITY","STATE","GAME_DATE",
+                 "USAGE_LITE","THREES_RATE","IS_HOME"]
+    for c in base_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    for tgt in TARGETS.values():
+        if tgt["label_col"] not in df.columns:
+            df[tgt["label_col"]] = np.nan
+    return df
+
+def load_train_log():
+    if Path(TRAIN_LOG).exists():
+        df = pd.read_csv(TRAIN_LOG)
+        df = ensure_train_log_columns(df)
+        # Coerce numeric
+        for c in ["PTS","REB","AST","FG3M","MIN","USAGE_LITE","THREES_RATE","IS_HOME"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+    else:
+        logging.warning("No training log found yet; will create a new one.")
+        cols = ["PLAYER","TEAM","TEAM_SIDE","PTS","REB","AST","FG3M","MIN",
+                "ARENA","CITY","STATE","GAME_DATE",
+                "USAGE_LITE","THREES_RATE","IS_HOME",
+                "hit30","hit4threes"]
+        return pd.DataFrame(columns=cols)
+
+def build_preprocessor():
+    numeric = NUM_COLS + ["USAGE_LITE","THREES_RATE","IS_HOME"]
+    categorical = CAT_COLS
+    return ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(with_mean=True, with_std=True), numeric),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical)
+        ],
+        remainder="drop"
+    )
+
+def train_one_target(train_df: pd.DataFrame, label_col: str):
+    # Only rows that have labels
+    labeled = train_df.dropna(subset=[label_col]).copy()
+    if len(labeled) < MIN_TRAIN_ROWS:
+        logging.warning(f"Not enough labeled rows for '{label_col}' (have {len(labeled)}, need {MIN_TRAIN_ROWS}). Will use fallback today.")
+        return None
+
+    X = labeled[NUM_COLS + ["USAGE_LITE","THREES_RATE","IS_HOME"] + CAT_COLS]
+    y = labeled[label_col].astype(int)
+
+    X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    pre = build_preprocessor()
+    base = LogisticRegression(max_iter=200, class_weight="balanced", solver="liblinear")
+    # Calibrate for better probability estimates
+    clf = Pipeline([
+        ("pre", pre),
+        ("lr", CalibratedClassifierCV(base, method="isotonic", cv=3))
+    ])
+
+    clf.fit(X_train, y_train)
+    # Validation AUC
+    try:
+        p_valid = clf.predict_proba(X_valid)[:,1]
+        auc = roc_auc_score(y_valid, p_valid)
+        logging.info(f"[{label_col}] Validation AUC: {auc:.3f} on {len(X_valid)} samples")
+    except Exception:
+        logging.info(f"[{label_col}] Model trained (AUC not computed).")
+
+    return clf
+
+def sigmoid(x):
+    return 1/(1+np.exp(-x))
+
+def fallback_probs(today: pd.DataFrame):
+    """
+    Conservative calibrated fallbacks using season per-game averages.
+    Tuned to give realistic base rates when no model yet.
+    """
+    # Rough league priors (tweakable):
+    # ~10-15% for 30+ points nights among starters,
+    # ~10% for ≥4 made threes among high-volume shooters.
+    p30 = sigmoid(0.22 * (today["PTS"] - 24.0) + 0.06 * today["USAGE_LITE"] + 0.8 * today["IS_HOME"])
+    p4  = sigmoid(0.95 * (today["FG3M"] - 2.7) + 0.05 * today["USAGE_LITE"] + 0.4 * today["IS_HOME"])
+    return p30.clip(0.01, 0.8), p4.clip(0.01, 0.8)
+
+def predict_today(models: dict, today: pd.DataFrame):
+    X_today = today[NUM_COLS + ["USAGE_LITE","THREES_RATE","IS_HOME"] + CAT_COLS]
+    preds = {}
+    for key, m in models.items():
+        if m is not None:
+            preds[key] = m.predict_proba(X_today)[:,1]
+        else:
+            preds[key] = None
+    return preds
+
+def save_predictions(today: pd.DataFrame, p30, p4):
+    out = today.copy()
+    out["prob_hit30"] = p30
+    out["prob_hit4threes"] = p4
+
+    # Two top-10 views
+    top30 = out.sort_values("prob_hit30", ascending=False).head(10)
+    top43 = out.sort_values("prob_hit4threes", ascending=False).head(10)
+
+    out.to_csv(PRED_TODAY, index=False)
+    logging.info(f"Saved predictions to {PRED_TODAY}")
+
+    # Pretty console view
+    def short(df):
+        cols = ["PLAYER","TEAM","TEAM_SIDE","PTS","FG3M","MIN","prob_hit30","prob_hit4threes","ARENA","CITY","STATE","GAME_DATE"]
+        keep = [c for c in cols if c in df.columns]
+        return df[keep]
+
+    logging.info("\n=== Top 10: PTS ≥ 30 (prob_hit30) ===\n" + short(top30).to_string(index=False))
+    logging.info("\n=== Top 10: FG3M ≥ 4 (prob_hit4threes) ===\n" + short(top43).to_string(index=False))
+
+def append_today_to_train_log(train_df: pd.DataFrame, today_df: pd.DataFrame):
+    """
+    Append today’s rows to training log (labels are NaN until you ingest box scores).
+    """
+    cols = train_df.columns.tolist()
+    aligned = today_df.reindex(columns=cols, fill_value=np.nan)
+    updated = pd.concat([train_df, aligned], ignore_index=True)
+    updated.to_csv(TRAIN_LOG, index=False)
+    logging.info(f"Appended {len(today_df)} rows to {TRAIN_LOG} (labels pending).")
+    return updated
+
+# ---------- Optional: helper you’ll run AFTER games finish ----------
+def ingest_boxscores(boxscore_csv: str):
+    """
+    After games finish, call this with a CSV that has actual outcomes
+    at minimum: PLAYER, TEAM, ACTUAL_PTS, ACTUAL_FG3M, GAME_DATE
+    It will set hit30 / hit4threes for those rows in the train log.
+    """
+    if not Path(TRAIN_LOG).exists():
+        logging.error("No training log to update.")
+        return
+    if not Path(boxscore_csv).exists():
+        logging.error(f"{boxscore_csv} not found.")
+        return
+
+    train = pd.read_csv(TRAIN_LOG)
+    box = pd.read_csv(boxscore_csv)
+
+    # Normalize types
+    for c in ["ACTUAL_PTS","ACTUAL_FG3M"]:
+        if c in box.columns:
+            box[c] = pd.to_numeric(box[c], errors="coerce")
+
+    # Create outcome labels
+    box["hit30"] = (box["ACTUAL_PTS"] >= 30).astype(int)
+    box["hit4threes"] = (box["ACTUAL_FG3M"] >= 4).astype(int)
+
+    # Merge outcomes back by PLAYER + TEAM + GAME_DATE
+    key_cols = ["PLAYER","TEAM","GAME_DATE"]
+    if not set(key_cols).issubset(box.columns):
+        logging.error(f"Boxscore file must contain {key_cols}")
+        return
+
+    # Update row-wise
+    keyed = box[key_cols + ["hit30","hit4threes"]]
+    # Join:
+    merged = train.merge(keyed, on=key_cols, how="left", suffixes=("","_new"))
+    for tgt in ["hit30","hit4threes"]:
+        merged[tgt] = merged[tgt].fillna(merged[f"{tgt}_new"])
+        if f"{tgt}_new" in merged.columns:
+            merged.drop(columns=[f"{tgt}_new"], inplace=True)
+
+    merged.to_csv(TRAIN_LOG, index=False)
+    logging.info(f"Updated labels in {TRAIN_LOG} from {boxscore_csv}.")
+
+# --------------- Main ---------------
+
+def main():
+    # Load today + add engineered features
+    today = load_today()
+
+    # Load or create training log
+    train_df = load_train_log()
+
+    # Add today to training log (labels to be filled later)
+    train_df = append_today_to_train_log(train_df, today)
+
+    # Train two targets if we have enough labeled data
+    models = {}
+    for key, meta in TARGETS.items():
+        label_col = meta["label_col"]
+        models[key] = train_one_target(train_df, label_col)
+
+    # If any model is None, compute fallback calibrated probabilities
+    preds = predict_today(models, today)
+    if preds["hit30"] is None or preds["hit4threes"] is None:
+        fb30, fb4 = fallback_probs(today)
+        if preds["hit30"] is None:
+            preds["hit30"] = fb30.values
+        if preds["hit4threes"] is None:
+            preds["hit4threes"] = fb4.values
+
+    # Save predictions + top 10s
+    save_predictions(today, preds["hit30"], preds["hit4threes"])
+
+if __name__ == "__main__":
+    main()

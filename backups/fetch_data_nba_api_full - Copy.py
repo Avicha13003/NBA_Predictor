@@ -1,0 +1,170 @@
+import os
+import pandas as pd
+import pytz
+import datetime
+import logging
+from nba_api.stats.endpoints import ScoreboardV2, LeagueDashPlayerStats
+from nba_api.stats.static import teams
+
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+# --- Arena location mapping ---
+ARENA_LOCATIONS = {
+    "State Farm Arena": {"city": "Atlanta", "state": "GA"},
+    "TD Garden": {"city": "Boston", "state": "MA"},
+    "Barclays Center": {"city": "Brooklyn", "state": "NY"},
+    "Spectrum Center": {"city": "Charlotte", "state": "NC"},
+    "United Center": {"city": "Chicago", "state": "IL"},
+    "Rocket Mortgage FieldHouse": {"city": "Cleveland", "state": "OH"},
+    "American Airlines Center": {"city": "Dallas", "state": "TX"},
+    "Ball Arena": {"city": "Denver", "state": "CO"},
+    "Little Caesars Arena": {"city": "Detroit", "state": "MI"},
+    "Chase Center": {"city": "San Francisco", "state": "CA"},
+    "Toyota Center": {"city": "Houston", "state": "TX"},
+    "Gainbridge Fieldhouse": {"city": "Indianapolis", "state": "IN"},
+    "Crypto.com Arena": {"city": "Los Angeles", "state": "CA"},
+    "Kaseya Center": {"city": "Miami", "state": "FL"},
+    "Fiserv Forum": {"city": "Milwaukee", "state": "WI"},
+    "Target Center": {"city": "Minneapolis", "state": "MN"},
+    "FedExForum": {"city": "Memphis", "state": "TN"},
+    "Smoothie King Center": {"city": "New Orleans", "state": "LA"},
+    "Madison Square Garden": {"city": "New York", "state": "NY"},
+    "Paycom Center": {"city": "Oklahoma City", "state": "OK"},
+    "Amway Center": {"city": "Orlando", "state": "FL"},
+    "Wells Fargo Center": {"city": "Philadelphia", "state": "PA"},
+    "Footprint Center": {"city": "Phoenix", "state": "AZ"},
+    "Moda Center": {"city": "Portland", "state": "OR"},
+    "Golden 1 Center": {"city": "Sacramento", "state": "CA"},
+    "Frost Bank Center": {"city": "San Antonio", "state": "TX"},
+    "Scotiabank Arena": {"city": "Toronto", "state": "ON"},
+    "Delta Center": {"city": "Salt Lake City", "state": "UT"},
+    "Capital One Arena": {"city": "Washington", "state": "DC"},
+    "Xfinity Mobile Arena": {"city": "Philadelphia", "state": "PA"}  # placeholder
+}
+
+# --- Helper functions ---
+def get_team_name(team_id: int) -> str:
+    for t in teams.get_teams():
+        if t["id"] == team_id:
+            return t["full_name"]
+    return f"Unknown ({team_id})"
+
+def get_team_abbr(team_name: str) -> str:
+    """Return team abbreviation for NBA API merging."""
+    for t in teams.get_teams():
+        if t["full_name"] == team_name:
+            return t["abbreviation"]
+    return "UNK"
+
+def get_today_schedule():
+    today = datetime.date.today()
+    logging.info(f"Fetching NBA schedule for {today}...")
+    try:
+        scoreboard = ScoreboardV2(game_date=today.strftime("%Y-%m-%d"))
+        games = scoreboard.game_header.get_data_frame()
+    except Exception as e:
+        logging.error(f"Failed to fetch schedule: {e}")
+        return pd.DataFrame()
+
+    if games.empty:
+        logging.warning("No NBA games found for today.")
+        return games
+
+    # Simplify relevant columns
+    games = games[["GAME_ID", "GAME_DATE_EST", "HOME_TEAM_ID", "VISITOR_TEAM_ID", "GAME_STATUS_TEXT", "ARENA_NAME"]]
+    games = games.rename(columns={
+        "GAME_DATE_EST": "GAME_DATE",
+        "ARENA_NAME": "ARENA"
+    })
+
+    # Add readable team names + city/state
+    games["HOME_TEAM"] = games["HOME_TEAM_ID"].apply(get_team_name)
+    games["AWAY_TEAM"] = games["VISITOR_TEAM_ID"].apply(get_team_name)
+    games["CITY"] = games["ARENA"].apply(lambda a: ARENA_LOCATIONS.get(a, {}).get("city", "Unknown"))
+    games["STATE"] = games["ARENA"].apply(lambda a: ARENA_LOCATIONS.get(a, {}).get("state", "Unknown"))
+
+    return games
+
+def fetch_player_stats():
+    """Fetch current season player averages."""
+    try:
+        stats = LeagueDashPlayerStats(per_mode_detailed="PerGame").get_data_frames()[0]
+        return stats
+    except Exception as e:
+        logging.error(f"Failed to fetch player stats: {e}")
+        return pd.DataFrame()
+
+def build_daily_stats():
+    games = get_today_schedule()
+    if games.empty:
+        logging.error("No games schedule fetched — aborting.")
+        return pd.DataFrame()
+
+    logging.info(f"✅ Found {len(games)} games for today")
+
+    player_stats = fetch_player_stats()
+    if player_stats.empty:
+        logging.error("No player stats fetched.")
+        return pd.DataFrame()
+
+    central = pytz.timezone("US/Central")
+    all_rows = []
+    for _, g in games.iterrows():
+
+        # Original UTC datetime from NBA API
+        game_dt_utc = pd.to_datetime(g["GAME_DATE"])
+
+        # GAME_DATE: keep the calendar date from NBA API (UTC)
+        game_date_str = game_dt_utc.strftime("%Y-%m-%d")
+
+        for side, team_col in [("Home", "HOME_TEAM"), ("Away", "AWAY_TEAM")]:
+            team_name = g[team_col]
+            team_abbr = get_team_abbr(team_name)
+            arena = g["ARENA"]
+            city = g["CITY"]
+            state = g["STATE"]
+            game_date = g["GAME_DATE"]
+
+            players = player_stats[player_stats["TEAM_ABBREVIATION"] == team_abbr]
+            if players.empty:
+                logging.warning(f"No players found for {team_name} ({team_abbr})")
+                continue
+
+            logging.info(f"Processing: {g['AWAY_TEAM']} @ {g['HOME_TEAM']} ({arena}, {city}, {state})")
+
+            for _, p in players.iterrows():
+                row = {
+                    "PLAYER": p["PLAYER_NAME"],
+                    "TEAM": p["TEAM_ABBREVIATION"],
+                    "TEAM_FULL": team_name,
+                    "TEAM_SIDE": side,
+                    "PTS": p["PTS"],
+                    "REB": p["REB"],
+                    "AST": p["AST"],
+                    "FG3M": p["FG3M"],
+                    "MIN": p["MIN"],
+                    "ARENA": arena,
+                    "CITY": city,
+                    "STATE": state,
+                    "GAME_DATE": game_date_str,
+                }
+                all_rows.append(row)
+
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        out_file = "nba_today_stats.csv"
+        df.to_csv(out_file, index=False)
+        logging.info(f"✅ Saved today's player + game data to {out_file}")
+    else:
+        logging.warning("No player data compiled.")
+
+    return df
+
+if __name__ == "__main__":
+    df = build_daily_stats()
+    if not df.empty:
+        print(df.head())
