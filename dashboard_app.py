@@ -1,60 +1,106 @@
-# dashboard_app.py — NBA Player Props Dashboard (mobile + free)
+# dashboard_app.py — NBA Player Props Dashboard (real hit rate trends)
 import streamlit as st
 import pandas as pd
-import requests
-from io import BytesIO
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="NBA Player Props Dashboard", layout="wide")
 
-# --- Load data ---
+# === Load data ===
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_csv("nba_prop_predictions_today.csv")
-        return df
-    except Exception:
-        st.error("⚠️ Could not load nba_prop_predictions_today.csv")
-        return pd.DataFrame()
+        props = pd.read_csv("nba_prop_predictions_today.csv")
+        logs = pd.read_csv("player_game_log.csv")
+        props["RECENT_OVER_PROB"] = pd.to_numeric(props["RECENT_OVER_PROB"], errors="coerce").fillna(0)
+        props["RECENT_N"] = pd.to_numeric(props["RECENT_N"], errors="coerce").fillna(0)
+        logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"], errors="coerce")
+        return props, logs
+    except Exception as e:
+        st.error(f"⚠️ Could not load CSVs: {e}")
+        return pd.DataFrame(), pd.DataFrame()
 
-df = load_data()
-if df.empty:
+props, logs = load_data()
+if props.empty or logs.empty:
     st.stop()
 
-# --- Helper: player & team images ---
+# === Helpers ===
 @st.cache_data
 def get_player_image(name):
     name_fmt = name.lower().replace(" ", "-")
-    url = f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png"
-    return url
+    return f"https://cdn.nba.com/headshots/nba/latest/260x190/{name_fmt}.png"
 
 @st.cache_data
 def get_team_logo(team_abbr):
-    if not team_abbr:
+    if not team_abbr or not isinstance(team_abbr, str):
         return ""
-    url = f"https://cdn.ssref.net/req/202106291/images/teams/{team_abbr.lower()}_logo.svg"
-    return url
+    return f"https://cdn.ssref.net/req/202106291/images/teams/{team_abbr.lower()}_logo.svg"
 
-# --- UI Header ---
+def get_hit_column(market):
+    return {
+        "PTS": "didHitOver_PTS",
+        "REB": "didHitOver_REB",
+        "AST": "didHitOver_AST",
+        "3PM": "didHitOver_FG3M",
+        "STL": "didHitOver_STL"
+    }.get(market)
+
+def render_hit_rate_chart(player, market):
+    hit_col = get_hit_column(market)
+    if not hit_col or hit_col not in logs.columns:
+        st.write("📉 No trend data available.")
+        return
+    dfp = logs[logs["PLAYER"].astype(str).str.strip() == player].copy()
+    if dfp.empty:
+        st.write("📉 No game log data.")
+        return
+    dfp = dfp.sort_values("GAME_DATE").tail(10)
+    dfp["Hit"] = pd.to_numeric(dfp[hit_col], errors="coerce").fillna(0).astype(int)
+    dfp["RollingRate"] = dfp["Hit"].rolling(5, min_periods=1).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dfp["GAME_DATE"], y=dfp["Hit"],
+        mode="lines+markers",
+        line=dict(color="green"), name="Hit (1=Over)"
+    ))
+    fig.add_trace(go.Scatter(
+        x=dfp["GAME_DATE"], y=dfp["RollingRate"],
+        mode="lines",
+        line=dict(color="orange", dash="dot"),
+        name="Rolling Avg"
+    ))
+    fig.update_layout(
+        height=150, margin=dict(l=0, r=0, t=0, b=0),
+        yaxis=dict(range=[-0.1, 1.1], tickvals=[0,1]),
+        xaxis_title=None, yaxis_title=None, showlegend=False
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# === UI Header ===
 st.title("🏀 NBA Player Props Dashboard")
-st.caption("Automatically updated daily — showing top overs from player prop predictions.")
+st.caption("Daily top player prop overs — with real hit trends, team logos, and injury context.")
 
-# --- Tabs per market ---
-markets = df["MARKET"].unique()
+# === Tabs ===
+markets = props["MARKET"].unique()
 tabs = st.tabs([f"🔥 {m}" for m in markets])
 
 for tab, market in zip(tabs, markets):
     with tab:
-        subset = df[df["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
+        subset = props[props["MARKET"] == market].sort_values("FINAL_OVER_PROB", ascending=False).head(10)
+
         for _, row in subset.iterrows():
             with st.container(border=True):
-                cols = st.columns([1, 4, 2])
+                cols = st.columns([1.2, 3, 2])
                 with cols[0]:
                     st.image(get_player_image(row["PLAYER"]), width=80)
                     st.image(get_team_logo(row["TEAM"]), width=50)
+
                 with cols[1]:
                     st.subheader(row["PLAYER"])
                     st.write(f"**{row['PROP_NAME']} o{row['LINE']}**")
-                    st.write(f"Team: `{row['TEAM']}` | Injury: {row['INJ_Status']}")
+                    st.write(f"Team: `{row['TEAM'] or '—'}` | Injury: {row['INJ_Status']}")
+                    st.write(f"Recent Hit Rate: {row['RECENT_OVER_PROB']*100:.1f}% ({int(row['RECENT_N'])} games)")
+
                 with cols[2]:
                     st.metric("Prob. Over", row["FINAL_OVER_PROB_PCT"])
-                    st.write(f"Recent Hit Rate: {row['RECENT_OVER_PROB']*100:.1f}% ({int(row['RECENT_N'])}g)")
+                    render_hit_rate_chart(row["PLAYER"], market)
