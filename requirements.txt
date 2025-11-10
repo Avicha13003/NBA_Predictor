@@ -1,4 +1,16 @@
+# --- Core Dashboard ---
 streamlit
-pandas
 plotly
+
+# --- Data Handling ---
+pandas
 numpy
+requests
+
+# --- Machine Learning ---
+scikit-learn
+xgboost
+joblib
+
+# --- Logging / Utilities ---
+python-dateutil
